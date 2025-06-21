@@ -1,0 +1,6 @@
+# requirements.txt
+runpod
+whisper-timestamped
+# openai-whisper is a dependency of the above and will be installed automatically
+torch
+torchaudio
