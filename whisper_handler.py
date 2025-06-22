@@ -1,31 +1,27 @@
-# whisper_handler.py (Corrected to handle raw PCM audio from Gemini TTS)
+# whisper_handler.py (Corrected with Audio "Laundering" Technique)
 import runpod
 import os
 import base64
 import tempfile
 import whisper_timestamped as whisper
 import json
-import subprocess # Make sure subprocess is imported
+import subprocess
 
 # Global variable to hold the Whisper model, so we only load it once.
 whisper_model = None
 
 def cold_start():
     """
-    This function is called once when the worker starts up.
-    It's the perfect place to load the heavy Whisper model into memory (and VRAM).
+    Loads the Whisper model into memory (and VRAM).
     """
     global whisper_model
     print("Cold start: Loading Whisper model...")
-    # Load the same model specified in the Dockerfile. 'medium' is a good choice.
-    # We specify device="cuda" to ensure it runs on the GPU.
     whisper_model = whisper.load_model("medium", device="cuda")
     print("Whisper model loaded successfully.")
 
 async def handler(job):
     """
-    This is the main handler function that processes each incoming request.
-    The 'job' object contains the input from the API call.
+    Processes each incoming transcription request.
     """
     print(f"Received transcription job: {job['id']}")
     job_input = job['input']
@@ -34,60 +30,57 @@ async def handler(job):
     if not audio_base64:
         return {"error": "No 'audio_base64' provided in job input."}
 
-    # Safety check: ensure the model is loaded.
     global whisper_model
     if whisper_model is None:
         cold_start()
 
-    # Use a temporary directory to safely handle file operations.
     with tempfile.TemporaryDirectory(dir="/tmp/whisper_audio") as temp_dir:
-        # --- START OF MODIFIED BLOCK ---
+        # --- START OF CORRECTED BLOCK ---
 
-        # 1. Define paths for the raw PCM input and the final WAV output
-        raw_audio_path = os.path.join(temp_dir, "input_audio.pcm")
-        wav_output_path = os.path.join(temp_dir, "input_audio.wav")
+        # 1. Define paths for the initial audio and the clean WAV output
+        temp_input_audio_path = os.path.join(temp_dir, "input.audio")
+        clean_wav_path = os.path.join(temp_dir, "output.wav")
 
-        # 2. Decode the base64 audio string and write it to the raw PCM file.
+        # 2. Decode the base64 audio string and write it to the initial file.
         try:
-            with open(raw_audio_path, "wb") as f:
+            with open(temp_input_audio_path, "wb") as f:
                 f.write(base64.b64decode(audio_base64))
-            print(f"Decoded base64 PCM audio to {raw_audio_path}")
+            print(f"Decoded base64 audio to {temp_input_audio_path}")
         except Exception as e:
             return {"error": f"Failed to decode base64 audio: {str(e)}"}
 
-        # 3. Use FFmpeg to convert the raw PCM data into a proper WAV file.
-        #    We must specify the input format details provided by the Gemini API.
+        # 3. Use FFmpeg to "launder" the audio file.
+        #    This command tells FFmpeg to auto-detect the input format and convert it
+        #    to a standard 16kHz mono WAV file, which is ideal for Whisper.
         ffmpeg_cmd = [
             'ffmpeg',
-            '-y',                   # Overwrite output file if it exists
-            '-f', 's16le',          # Input format: signed 16-bit little-endian PCM
-            '-ar', '24000',         # Input sample rate: 24000 Hz
-            '-ac', '1',             # Input channels: 1 (mono)
-            '-i', raw_audio_path,   # The input raw audio file
-            wav_output_path         # The output WAV file
+            '-i', temp_input_audio_path, # Input file
+            '-ar', '16000',              # Output sample rate: 16000 Hz
+            '-ac', '1',                  # Output channels: 1 (mono)
+            '-c:a', 'pcm_s16le',         # Output codec: standard 16-bit PCM
+            clean_wav_path               # The clean output WAV file
         ]
 
-        print(f"Running FFmpeg to convert PCM to WAV: {' '.join(ffmpeg_cmd)}")
+        print(f"Running FFmpeg to normalize audio: {' '.join(ffmpeg_cmd)}")
         try:
-            result = subprocess.run(ffmpeg_cmd, check=True, capture_output=True, text=True)
-            print("FFmpeg conversion successful.")
+            # We use a timeout to prevent hung processes
+            result = subprocess.run(ffmpeg_cmd, check=True, capture_output=True, text=True, timeout=30)
+            print("FFmpeg audio normalization successful.")
         except subprocess.CalledProcessError as e:
-            print("FFmpeg PCM-to-WAV conversion failed.")
+            print("FFmpeg audio normalization failed.")
             print("FFmpeg STDERR:", e.stderr)
-            return {"error": "FFmpeg PCM-to-WAV conversion failed.", "details": e.stderr}
+            return {"error": "FFmpeg audio normalization failed.", "details": e.stderr}
+        except subprocess.TimeoutExpired:
+            return {"error": "FFmpeg audio normalization timed out."}
 
-        # --- END OF MODIFIED BLOCK ---
+        # --- END OF CORRECTED BLOCK ---
 
-        # Perform the transcription using the correctly formatted WAV file.
+        # 4. Transcribe the CLEAN audio file.
         try:
-            # Load the audio file using whisper's helper function.
-            # CRUCIALLY, we load the new WAV file, not the original input.
-            audio = whisper.load_audio(wav_output_path)
-
-            # Transcribe the audio. Specify the language if you know it for better accuracy.
+            audio = whisper.load_audio(clean_wav_path)
             result = whisper.transcribe(whisper_model, audio, language="en") # Change to "hi" for Hindi
 
-            # Flatten the word list for easier processing by the next service.
+            # Flatten the word list for easier processing
             all_words = []
             for segment in result["segments"]:
                 for word in segment["words"]:
@@ -99,15 +92,18 @@ async def handler(job):
 
             print(f"Transcription successful. Found {len(all_words)} words.")
             
-            # Return the final, structured JSON object.
             return {
                 "full_text": result["text"],
                 "words": all_words
             }
 
         except Exception as e:
-            print(f"Error during transcription: {str(e)}")
-            return {"error": f"Transcription failed: {str(e)}"}
+            # Include the error message in the output for easier debugging
+            error_message = str(e)
+            print(f"Error during transcription: {error_message}")
+            if "ffmpeg" in error_message:
+                return {"error": f"Transcription failed: Failed to load audio: {error_message}"}
+            return {"error": f"Transcription failed: {error_message}"}
 
 # Register our functions with the RunPod serverless SDK.
 runpod.serverless.start({
