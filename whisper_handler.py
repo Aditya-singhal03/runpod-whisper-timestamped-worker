@@ -91,10 +91,12 @@ async def handler(job):
                     })
 
             print(f"Transcription successful. Found {len(all_words)} words.")
-            
+            with open(clean_wav_path, "rb") as f:
+                clean_audio_base64 = base64.b64encode(f.read()).decode('utf-8')
             return {
                 "full_text": result["text"],
-                "words": all_words
+                "words": all_words,
+                "audio_base64": clean_audio_base64
             }
 
         except Exception as e:
